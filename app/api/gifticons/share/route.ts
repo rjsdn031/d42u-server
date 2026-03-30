@@ -5,13 +5,13 @@ import { FieldValue } from "firebase-admin/firestore";
 export const runtime = "nodejs";
 
 type ShareGifticonRequest = {
-  gifticonId: string;      // 로컬 Hive ID (Flutter에서 생성한 UUID)
-  ownerId: string;         // 기기 ID
-  imageBase64: string;     // 이미지 base64 (data:image/... 포함 가능)
+  gifticonId: string;
+  ownerId: string;
+  imageBase64: string;
   merchantName?: string | null;
   itemName?: string | null;
   couponNumber?: string | null;
-  expiresAt: string;       // ISO 8601
+  expiresAt: string;
 };
 
 type DeviceDoc = {
@@ -48,22 +48,14 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // owner nickname 조회
+    // owner nickname 조회 — 미등록이어도 null로 진행 (공유 차단하지 않음)
     const ownerSnap = await db.collection("devices").doc(ownerId).get();
-    if (!ownerSnap.exists) {
-      return NextResponse.json(
-        { error: "Owner device is not registered." },
-        { status: 404 }
-      );
-    }
-
     const ownerData = ownerSnap.data() as DeviceDoc | undefined;
-    const ownerNickname = ownerData?.nickname?.trim();
+    const ownerNickname = ownerData?.nickname?.trim() ?? null;
 
-    if (!ownerNickname) {
-      return NextResponse.json(
-        { error: "Owner nickname is missing." },
-        { status: 400 }
+    if (!ownerSnap.exists) {
+      console.warn(
+        `[share] owner device not registered: ownerId=${ownerId} — proceeding without nickname`
       );
     }
 
@@ -117,7 +109,7 @@ export async function POST(req: NextRequest) {
     });
 
     console.log(
-      `[share] gifticonId=${gifticonId} uploaded and registered ownerNickname=${ownerNickname}`
+      `[share] gifticonId=${gifticonId} uploaded ownerNickname=${ownerNickname}`
     );
 
     return NextResponse.json(
