@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { db, bucket } from "../../../../lib/firebase";
+import { db, bucket, messaging } from "../../../../lib/firebase";
 import { FieldValue } from "firebase-admin/firestore";
 
 export const runtime = "nodejs";
@@ -18,6 +18,87 @@ type DeviceDoc = {
   nickname?: string;
   fcmToken?: string;
 };
+
+async function matchAndNotify({
+  gifticonId,
+  ownerId,
+  ownerNickname,
+  imageUrl,
+  merchantName,
+  itemName,
+  couponNumber,
+  expiresAt,
+}: {
+  gifticonId: string;
+  ownerId: string;
+  ownerNickname: string | null;
+  imageUrl: string;
+  merchantName: string | null;
+  itemName: string | null;
+  couponNumber: string | null;
+  expiresAt: string;
+}): Promise<{ matched: boolean; receiverId?: string }> {
+  // owner 제외한 기기 목록 조회
+  const devicesSnap = await db.collection("devices").get();
+  const candidates = devicesSnap.docs
+    .map((d) => {
+      const data = d.data() as DeviceDoc;
+      return {
+        deviceId: d.id,
+        fcmToken: data.fcmToken ?? "",
+        nickname: data.nickname ?? "",
+      };
+    })
+    .filter((d) => d.fcmToken !== "" && d.deviceId !== ownerId);
+
+  if (candidates.length === 0) {
+    console.log(`[share/match] no candidates for gifticonId=${gifticonId}`);
+    return { matched: false };
+  }
+
+  // 랜덤 선택
+  const receiver = candidates[Math.floor(Math.random() * candidates.length)];
+
+  // Firestore 매칭 업데이트
+  await db.collection("gifticons").doc(gifticonId).update({
+    receiverId: receiver.deviceId,
+    receiverNickname: receiver.nickname || null,
+    status: "matched",
+    matchedAt: FieldValue.serverTimestamp(),
+  });
+
+  console.log(
+    `[share/match] matched gifticonId=${gifticonId} → receiverId=${receiver.deviceId}`
+  );
+
+  // 수신자에게 FCM 발송
+  try {
+    await messaging.send({
+      token: receiver.fcmToken,
+      notification: {
+        title: "기프티콘이 도착했어요 🎁",
+        body: `${merchantName ?? ""} ${itemName ?? "기프티콘"}을 받았어요. 지금 확인해보세요!`.trim(),
+      },
+      data: {
+        type: "gifticon_received",
+        gifticonId,
+        imageUrl,
+        merchantName: merchantName ?? "",
+        itemName: itemName ?? "",
+        couponNumber: couponNumber ?? "",
+        expiresAt,
+        ownerId,
+        ownerNickname: ownerNickname ?? "",
+      },
+      android: { priority: "high" },
+    });
+    console.log(`[share/match] FCM sent to receiverId=${receiver.deviceId}`);
+  } catch (fcmError) {
+    console.warn(`[share/match] FCM failed for receiverId=${receiver.deviceId}:`, fcmError);
+  }
+
+  return { matched: true, receiverId: receiver.deviceId };
+}
 
 export async function POST(req: NextRequest) {
   try {
@@ -48,7 +129,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // owner nickname 조회 — 미등록이어도 null로 진행 (공유 차단하지 않음)
+    // owner nickname 조회 — 미등록이어도 null로 진행
     const ownerSnap = await db.collection("devices").doc(ownerId).get();
     const ownerData = ownerSnap.data() as DeviceDoc | undefined;
     const ownerNickname = ownerData?.nickname?.trim() ?? null;
@@ -73,11 +154,10 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // base64 → Buffer
+    // base64 → Buffer → Storage 업로드
     const base64Data = imageBase64.replace(/^data:image\/\w+;base64,/, "");
     const imageBuffer = Buffer.from(base64Data, "base64");
 
-    // Firebase Storage 업로드
     const filePath = `gifticons/${gifticonId}.jpg`;
     const file = bucket.file(filePath);
 
@@ -112,8 +192,26 @@ export async function POST(req: NextRequest) {
       `[share] gifticonId=${gifticonId} uploaded ownerNickname=${ownerNickname}`
     );
 
+    // 등록 즉시 매칭 시도
+    const matchResult = await matchAndNotify({
+      gifticonId,
+      ownerId,
+      ownerNickname,
+      imageUrl,
+      merchantName: merchantName ?? null,
+      itemName: itemName ?? null,
+      couponNumber: couponNumber ?? null,
+      expiresAt,
+    });
+
     return NextResponse.json(
-      { gifticonId, imageUrl, ownerNickname },
+      {
+        gifticonId,
+        imageUrl,
+        ownerNickname,
+        matched: matchResult.matched,
+        receiverId: matchResult.receiverId ?? null,
+      },
       { status: 201 }
     );
   } catch (error) {
