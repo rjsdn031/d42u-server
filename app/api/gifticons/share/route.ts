@@ -14,6 +14,11 @@ type ShareGifticonRequest = {
   expiresAt: string;       // ISO 8601
 };
 
+type DeviceDoc = {
+  nickname?: string;
+  fcmToken?: string;
+};
+
 export async function POST(req: NextRequest) {
   try {
     let body: ShareGifticonRequest;
@@ -43,11 +48,35 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    // owner nickname 조회
+    const ownerSnap = await db.collection("devices").doc(ownerId).get();
+    if (!ownerSnap.exists) {
+      return NextResponse.json(
+        { error: "Owner device is not registered." },
+        { status: 404 }
+      );
+    }
+
+    const ownerData = ownerSnap.data() as DeviceDoc | undefined;
+    const ownerNickname = ownerData?.nickname?.trim();
+
+    if (!ownerNickname) {
+      return NextResponse.json(
+        { error: "Owner nickname is missing." },
+        { status: 400 }
+      );
+    }
+
     // 이미 공유된 문서인지 확인 (중복 방지)
     const existing = await db.collection("gifticons").doc(gifticonId).get();
     if (existing.exists) {
       return NextResponse.json(
-        { gifticonId, imageUrl: existing.data()?.imageUrl, alreadyShared: true },
+        {
+          gifticonId,
+          imageUrl: existing.data()?.imageUrl,
+          ownerNickname: existing.data()?.ownerNickname ?? ownerNickname,
+          alreadyShared: true,
+        },
         { status: 200 }
       );
     }
@@ -71,7 +100,9 @@ export async function POST(req: NextRequest) {
     await db.collection("gifticons").doc(gifticonId).set({
       gifticonId,
       ownerId,
+      ownerNickname,
       receiverId: null,
+      receiverNickname: null,
       imageUrl,
       merchantName: merchantName ?? null,
       itemName: itemName ?? null,
@@ -79,13 +110,20 @@ export async function POST(req: NextRequest) {
       expiresAt: new Date(expiresAt),
       status: "pending_match",
       sharedAt: FieldValue.serverTimestamp(),
+      matchedAt: null,
       usedAt: null,
       usedBy: null,
+      usedByNickname: null,
     });
 
-    console.log(`[share] gifticonId=${gifticonId} uploaded and registered`);
+    console.log(
+      `[share] gifticonId=${gifticonId} uploaded and registered ownerNickname=${ownerNickname}`
+    );
 
-    return NextResponse.json({ gifticonId, imageUrl }, { status: 201 });
+    return NextResponse.json(
+      { gifticonId, imageUrl, ownerNickname },
+      { status: 201 }
+    );
   } catch (error) {
     console.error("[/api/gifticons/share] error:", error);
     return NextResponse.json(

@@ -10,6 +10,11 @@ function isAuthorizedCron(req: NextRequest): boolean {
   return secret === `Bearer ${process.env.CRON_SECRET}`;
 }
 
+type DeviceDoc = {
+  fcmToken?: string;
+  nickname?: string;
+};
+
 export async function GET(req: NextRequest) {
   if (!isAuthorizedCron(req)) {
     return NextResponse.json({ error: "Unauthorized." }, { status: 401 });
@@ -27,12 +32,18 @@ export async function GET(req: NextRequest) {
       return NextResponse.json({ matched: 0 }, { status: 200 });
     }
 
-    // 2. 등록된 FCM 토큰 목록 조회 (기기 등록 컬렉션)
+    // 2. 등록된 기기 목록 조회
     const devicesSnap = await db.collection("devices").get();
-    const devices = devicesSnap.docs.map((d) => ({
-      deviceId: d.id,
-      fcmToken: d.data().fcmToken as string,
-    }));
+    const devices = devicesSnap.docs
+      .map((d) => {
+        const data = d.data() as DeviceDoc;
+        return {
+          deviceId: d.id,
+          fcmToken: data.fcmToken ?? "",
+          nickname: data.nickname ?? "",
+        };
+      })
+      .filter((d) => d.fcmToken !== "");
 
     let matchedCount = 0;
 
@@ -40,6 +51,7 @@ export async function GET(req: NextRequest) {
       const data = doc.data();
       const gifticonId = doc.id;
       const ownerId = data.ownerId as string;
+      const ownerNickname = (data.ownerNickname as string | undefined) ?? "";
 
       // owner 제외한 후보 목록
       const candidates = devices.filter((d) => d.deviceId !== ownerId);
@@ -50,17 +62,19 @@ export async function GET(req: NextRequest) {
       }
 
       // 랜덤 선택
-      const receiver = candidates[Math.floor(Math.random() * candidates.length)];
+      const receiver =
+        candidates[Math.floor(Math.random() * candidates.length)];
 
       // 3. Firestore 업데이트
       await db.collection("gifticons").doc(gifticonId).update({
         receiverId: receiver.deviceId,
+        receiverNickname: receiver.nickname || null,
         status: "matched",
         matchedAt: FieldValue.serverTimestamp(),
       });
 
       console.log(
-        `[cron/match] matched gifticonId=${gifticonId} → receiverId=${receiver.deviceId}`
+        `[cron/match] matched gifticonId=${gifticonId} → receiverId=${receiver.deviceId}, receiverNickname=${receiver.nickname}`
       );
 
       // 4. 수신자에게 FCM 발송
@@ -82,6 +96,7 @@ export async function GET(req: NextRequest) {
               .toDate()
               .toISOString(),
             ownerId,
+            ownerNickname,
           },
           android: {
             priority: "high",
