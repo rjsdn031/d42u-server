@@ -10,6 +10,16 @@ type RegisterDeviceRequest = {
   fcmToken: string;
 };
 
+const adjectives = ["반짝이는", "포근한", "용감한", "재빠른", "행복한"];
+const animals = ["수달", "고양이", "토끼", "여우", "참새"];
+
+const generateNickname = () => {
+  const adjective =
+    adjectives[Math.floor(Math.random() * adjectives.length)];
+  const animal = animals[Math.floor(Math.random() * animals.length)];
+  return `${adjective}${animal}`;
+};
+
 export async function POST(req: NextRequest) {
   try {
     let body: RegisterDeviceRequest;
@@ -31,17 +41,36 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    await db.collection("devices").doc(deviceId).set(
+    const docRef = db.collection("devices").doc(deviceId);
+    const snap = await docRef.get();
+
+    let nickname: string;
+
+    if (snap.exists && snap.data()?.nickname) {
+      nickname = snap.data()!.nickname as string;
+    } else {
+      nickname = generateNickname();
+    }
+
+    await docRef.set(
       {
         fcmToken,
+        nickname,
         updatedAt: FieldValue.serverTimestamp(),
       },
-      { merge: true } // 이미 있으면 토큰만 갱신
+      { merge: true }
     );
 
-    console.log(`[devices/register] deviceId=${deviceId}`);
+    console.log(`[devices/register] deviceId=${deviceId}, nickname=${nickname}`);
 
-    return NextResponse.json({ ok: true }, { status: 200 });
+    return NextResponse.json(
+      {
+        ok: true,
+        deviceId,
+        nickname,
+      },
+      { status: 200 }
+    );
   } catch (error) {
     console.error("[/api/devices/register] error:", error);
     return NextResponse.json(
