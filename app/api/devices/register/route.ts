@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "../../../../lib/firebase";
+import { adjectives, animals } from "@/lib/nickname-words";
 import { firestore } from "firebase-admin";
 const { FieldValue } = firestore;
 
@@ -10,14 +11,12 @@ type RegisterDeviceRequest = {
   fcmToken: string;
 };
 
-const adjectives = ["반짝이는", "포근한", "용감한", "재빠른", "행복한"];
-const animals = ["수달", "고양이", "토끼", "여우", "참새"];
-
 const generateNickname = () => {
   const adjective =
     adjectives[Math.floor(Math.random() * adjectives.length)];
   const animal = animals[Math.floor(Math.random() * animals.length)];
-  return `${adjective}${animal}`;
+  const number = String(Math.floor(Math.random() * 100)).padStart(2, "0");
+  return `${adjective}${animal}${number}`;
 };
 
 export async function POST(req: NextRequest) {
