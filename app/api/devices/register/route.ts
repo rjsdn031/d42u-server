@@ -1,7 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "../../../../lib/firebase";
-import { adjectives, animals } from "@/lib/nickname-words";
 import { firestore } from "firebase-admin";
+import { adjectives, animals } from "../../../../lib/nickname-words";
+
 const { FieldValue } = firestore;
 
 export const runtime = "nodejs";
@@ -15,8 +16,25 @@ const generateNickname = () => {
   const adjective =
     adjectives[Math.floor(Math.random() * adjectives.length)];
   const animal = animals[Math.floor(Math.random() * animals.length)];
-  const number = String(Math.floor(Math.random() * 100)).padStart(2, "0");
-  return `${adjective}${animal}${number}`;
+  return `${adjective}${animal}`;
+};
+
+const generateUniqueNickname = async () => {
+  for (let i = 0; i < 20; i++) {
+    const candidate = generateNickname();
+
+    const snapshot = await db
+      .collection("devices")
+      .where("nickname", "==", candidate)
+      .limit(1)
+      .get();
+
+    if (snapshot.empty) {
+      return candidate;
+    }
+  }
+
+  throw new Error("Failed to generate unique nickname.");
 };
 
 export async function POST(req: NextRequest) {
@@ -48,7 +66,7 @@ export async function POST(req: NextRequest) {
     if (snap.exists && snap.data()?.nickname) {
       nickname = snap.data()!.nickname as string;
     } else {
-      nickname = generateNickname();
+      nickname = await generateUniqueNickname();
     }
 
     await docRef.set(
