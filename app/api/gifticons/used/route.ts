@@ -26,19 +26,25 @@ async function getDeviceInfo(deviceId: string): Promise<DeviceDoc | null> {
   };
 }
 
-async function getCounterpartToken(
+async function getNotificationTargets(
   data: FirebaseFirestore.DocumentData,
   usedBy: string
-): Promise<string | null> {
-  const isOwner = usedBy === data.ownerId;
-  const counterpartId = isOwner ? data.receiverId : data.ownerId;
+): Promise<string[]> {
+  const ownerId = data.ownerId as string | undefined;
+  const receiverIds = Array.isArray(data.receiverIds)
+    ? (data.receiverIds as string[])
+    : [];
 
-  if (!counterpartId) return null;
+  const participants = new Set<string>();
 
-  const deviceInfo = await getDeviceInfo(counterpartId);
-  if (!deviceInfo?.fcmToken) return null;
+  if (ownerId) participants.add(ownerId);
+  for (const receiverId of receiverIds) {
+    if (receiverId) participants.add(receiverId);
+  }
 
-  return deviceInfo.fcmToken;
+  participants.delete(usedBy);
+
+  return [...participants];
 }
 
 export async function POST(req: NextRequest) {
@@ -81,9 +87,24 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    const ownerId = data.ownerId as string | undefined;
+    const receiverIds = Array.isArray(data.receiverIds)
+      ? (data.receiverIds as string[])
+      : [];
+
+    const isOwner = usedBy === ownerId;
+    const isReceiver = receiverIds.includes(usedBy);
+
+    if (!isOwner && !isReceiver) {
+      return NextResponse.json(
+        { error: "usedBy is not allowed to use this gifticon." },
+        { status: 403 }
+      );
+    }
+
     // 닉네임은 없어도 사용 처리는 항상 진행
     const usedByDevice = await getDeviceInfo(usedBy);
-    const usedByNickname = usedByDevice?.nickname?.trim() ?? null;
+    const usedByNickname = usedByDevice?.nickname?.trim() || null;
 
     await docRef.update({
       status: "used",
@@ -96,39 +117,78 @@ export async function POST(req: NextRequest) {
       `[used] gifticonId=${gifticonId} marked as used by ${usedBy}, nickname=${usedByNickname}`
     );
 
-    // 상대방 FCM 발송
-    const counterpartToken = await getCounterpartToken(data, usedBy);
+    // owner + 다른 receivers에게 모두 알림
+    const targetIds = await getNotificationTargets(data, usedBy);
 
-    if (counterpartToken) {
+    const targetInfos = await Promise.all(
+      targetIds.map(async (deviceId) => {
+        const info = await getDeviceInfo(deviceId);
+        return {
+          deviceId,
+          fcmToken: info?.fcmToken?.trim() ?? "",
+        };
+      })
+    );
+
+    const validTargets = targetInfos.filter((t) => t.fcmToken);
+
+    if (validTargets.length > 0) {
       const displayName = usedByNickname ? `${usedByNickname}님` : "누군가";
-      try {
-        await messaging.send({
-          token: counterpartToken,
-          notification: {
-            title: "기프티콘이 사용되었어요",
-            body: `${data.itemName ?? "기프티콘"}을 ${displayName}이 사용했어요.`,
-          },
-          data: {
-            type: "gifticon_used",
-            gifticonId,
-            usedBy,
-            usedByNickname: usedByNickname ?? "",
-          },
-          android: { priority: "high" },
-        });
-        console.log(
-          `[used] FCM sent to counterpart token=${counterpartToken.slice(0, 10)}...`
-        );
-      } catch (fcmError) {
-        console.warn("[used] FCM send failed:", fcmError);
-      }
+
+      const results = await Promise.allSettled(
+        validTargets.map((target) =>
+          messaging.send({
+            token: target.fcmToken,
+            notification: {
+              title: "기프티콘이 사용되었어요",
+              body: `${data.itemName ?? "기프티콘"}을 ${displayName}이 사용했어요.`,
+            },
+            data: {
+              type: "gifticon_used",
+              gifticonId,
+              usedBy,
+              usedByNickname: usedByNickname ?? "",
+            },
+            android: { priority: "high" },
+          })
+        )
+      );
+
+      const successCount = results.filter(
+        (result) => result.status === "fulfilled"
+      ).length;
+
+      const failCount = results.filter(
+        (result) => result.status === "rejected"
+      ).length;
+
+      console.log(
+        `[used] FCM sent: success=${successCount}, fail=${failCount}, targets=${validTargets.length}`
+      );
+
+      results.forEach((result, index) => {
+        if (result.status === "rejected") {
+          console.warn(
+            `[used] FCM send failed for target=${validTargets[index].deviceId}:`,
+            result.reason
+          );
+        }
+      });
     } else {
       console.log(
-        `[used] no counterpart FCM token found for gifticonId=${gifticonId}`
+        `[used] no valid target FCM tokens found for gifticonId=${gifticonId}`
       );
     }
 
-    return NextResponse.json({ gifticonId, usedBy, usedByNickname }, { status: 200 });
+    return NextResponse.json(
+      {
+        gifticonId,
+        usedBy,
+        usedByNickname,
+        notifiedTargetIds: validTargets.map((t) => t.deviceId),
+      },
+      { status: 200 }
+    );
   } catch (error) {
     console.error("[/api/gifticons/used] error:", error);
     return NextResponse.json(
