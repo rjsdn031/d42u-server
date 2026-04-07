@@ -1,311 +1,169 @@
+import OpenAI from "openai";
 import { NextRequest, NextResponse } from "next/server";
-import { db, messaging } from "../../../../lib/firebase";
-import { firestore } from "firebase-admin";
-const { FieldValue } = firestore;
 
 export const runtime = "nodejs";
 
-type UsedGifticonRequest = {
-  gifticonId: string;
-  usedBy: string;
+const client = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
+
+type ParseGifticonRequest = {
+  rawText?: string;
 };
 
-type DeviceDoc = {
-  fcmToken?: string;
-  nickname?: string;
+type GifticonParseResult = {
+  merchantName: string | null;
+  itemName: string | null;
+  expiresAt: string | null;
+  couponNumber: string | null;
 };
 
-async function getDeviceInfo(deviceId: string): Promise<DeviceDoc | null> {
-  console.log(`[used/device] loading deviceId=${deviceId}`);
-
-  const deviceDoc = await db.collection("devices").doc(deviceId).get();
-  if (!deviceDoc.exists) {
-    console.log(`[used/device] device not found deviceId=${deviceId}`);
-    return null;
-  }
-
-  const data = deviceDoc.data() as DeviceDoc | undefined;
-
-  console.log("[used/device] device loaded", {
-    deviceId,
-    hasToken: Boolean(data?.fcmToken),
-    nickname: data?.nickname ?? null,
-  });
-
-  return {
-    fcmToken: data?.fcmToken ?? "",
-    nickname: data?.nickname ?? "",
-  };
-}
-
-async function getNotificationTargets(
-  data: FirebaseFirestore.DocumentData,
-  usedBy: string
-): Promise<string[]> {
-  const ownerId = data.ownerId as string | undefined;
-  const receiverIds = Array.isArray(data.receiverIds)
-    ? (data.receiverIds as string[])
-    : [];
-
-  console.log("[used/targets] raw participants", {
-    ownerId: ownerId ?? null,
-    receiverIds,
-    usedBy,
-  });
-
-  const participants = new Set<string>();
-
-  if (ownerId) participants.add(ownerId);
-  for (const receiverId of receiverIds) {
-    if (receiverId) participants.add(receiverId);
-  }
-
-  participants.delete(usedBy);
-
-  const result = [...participants];
-
-  console.log("[used/targets] resolved", {
-    usedBy,
-    targetIds: result,
-  });
-
-  return result;
-}
+const gifticonSchema = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    merchantName: { type: ["string", "null"] },
+    itemName: { type: ["string", "null"] },
+    expiresAt: { type: ["string", "null"] },
+    couponNumber: { type: ["string", "null"] },
+  },
+  required: ["merchantName", "itemName", "expiresAt", "couponNumber"],
+} as const;
 
 export async function POST(req: NextRequest) {
   try {
-    console.log("[/api/gifticons/used] request received");
+    console.log("[/api/gifticons/parse] request received");
 
-    let body: UsedGifticonRequest;
+    if (!process.env.OPENAI_API_KEY) {
+      console.error("[/api/gifticons/parse] OPENAI_API_KEY is missing");
+      return NextResponse.json(
+        { error: "OPENAI_API_KEY is not set." },
+        { status: 500 }
+      );
+    }
+
+    let body: ParseGifticonRequest;
+
     try {
-      body = (await req.json()) as UsedGifticonRequest;
+      body = (await req.json()) as ParseGifticonRequest;
+      console.log("[/api/gifticons/parse] raw body parsed", {
+        hasRawText: Boolean(body.rawText),
+        rawTextLength: body.rawText?.length ?? 0,
+        rawTextPreview: body.rawText?.slice(0, 120) ?? "",
+      });
     } catch (jsonError) {
-      console.warn("[/api/gifticons/used] invalid json body", jsonError);
+      console.warn("[/api/gifticons/parse] invalid or empty JSON body", jsonError);
       return NextResponse.json(
-        { error: "Invalid JSON body." },
+        { error: "Invalid or empty JSON body." },
         { status: 400 }
       );
     }
 
-    const { gifticonId, usedBy } = body;
+    const rawText = body.rawText?.trim();
 
-    console.log("[/api/gifticons/used] parsed body", {
-      gifticonId,
-      usedBy,
+    console.log("[/api/gifticons/parse] normalized rawText", {
+      hasRawText: Boolean(rawText),
+      rawTextLength: rawText?.length ?? 0,
+      rawTextPreview: rawText?.slice(0, 120) ?? "",
     });
 
-    if (!gifticonId || !usedBy) {
-      console.warn("[/api/gifticons/used] missing required fields", {
-        gifticonId,
-        usedBy,
-      });
-
+    if (!rawText) {
+      console.warn("[/api/gifticons/parse] rawText is missing after trim");
       return NextResponse.json(
-        { error: "gifticonId and usedBy are required." },
+        { error: "rawText is required." },
         { status: 400 }
       );
     }
 
-    const docRef = db.collection("gifticons").doc(gifticonId);
-    console.log(`[/api/gifticons/used] loading gifticon doc gifticonId=${gifticonId}`);
-    const doc = await docRef.get();
-
-    if (!doc.exists) {
-      console.warn(`[/api/gifticons/used] gifticon not found gifticonId=${gifticonId}`);
-      return NextResponse.json(
-        { error: "Gifticon not found." },
-        { status: 404 }
-      );
-    }
-
-    const data = doc.data()!;
-
-    console.log("[/api/gifticons/used] gifticon loaded", {
-      gifticonId,
-      status: data.status,
-      ownerId: data.ownerId,
-      receiverIds: Array.isArray(data.receiverIds) ? data.receiverIds : [],
-      itemName: data.itemName ?? null,
-      usedByStored: data.usedBy ?? null,
-      usedByNicknameStored: data.usedByNickname ?? null,
+    console.log("[/api/gifticons/parse] calling OpenAI responses.create", {
+      model: "gpt-5-nano",
+      rawTextLength: rawText.length,
     });
 
-    if (data.status === "used") {
-      console.log(`[/api/gifticons/used] already used gifticonId=${gifticonId}`);
-      return NextResponse.json(
-        { gifticonId, alreadyUsed: true },
-        { status: 200 }
-      );
-    }
-
-    const ownerId = data.ownerId as string | undefined;
-    const receiverIds = Array.isArray(data.receiverIds)
-      ? (data.receiverIds as string[])
-      : [];
-
-    const isOwner = usedBy === ownerId;
-    const isReceiver = receiverIds.includes(usedBy);
-
-    console.log("[/api/gifticons/used] permission check", {
-      gifticonId,
-      usedBy,
-      ownerId,
-      receiverIds,
-      isOwner,
-      isReceiver,
-    });
-
-    if (!isOwner && !isReceiver) {
-      console.warn("[/api/gifticons/used] unauthorized usedBy", {
-        gifticonId,
-        usedBy,
-      });
-
-      return NextResponse.json(
-        { error: "usedBy is not allowed to use this gifticon." },
-        { status: 403 }
-      );
-    }
-
-    const usedByDevice = await getDeviceInfo(usedBy);
-    const usedByNickname = usedByDevice?.nickname?.trim() || null;
-
-    console.log("[/api/gifticons/used] actor info", {
-      usedBy,
-      usedByNickname,
-      hasActorToken: Boolean(usedByDevice?.fcmToken),
-    });
-
-    console.log("[/api/gifticons/used] updating gifticon status to used", {
-      gifticonId,
-      usedBy,
-      usedByNickname,
-    });
-
-    await docRef.update({
-      status: "used",
-      usedBy,
-      usedByNickname,
-      usedAt: FieldValue.serverTimestamp(),
-    });
-
-    console.log("[/api/gifticons/used] marked as used", {
-      gifticonId,
-      usedBy,
-      usedByNickname,
-    });
-
-    const targetIds = await getNotificationTargets(data, usedBy);
-
-    console.log("[/api/gifticons/used] notification targets resolved", {
-      gifticonId,
-      targetIds,
-    });
-
-    const targetInfos = await Promise.all(
-      targetIds.map(async (deviceId) => {
-        const info = await getDeviceInfo(deviceId);
-        return {
-          deviceId,
-          fcmToken: info?.fcmToken?.trim() ?? "",
-          nickname: info?.nickname?.trim() ?? "",
-        };
-      })
-    );
-
-    console.log("[/api/gifticons/used] target infos", {
-      gifticonId,
-      targets: targetInfos.map((t) => ({
-        deviceId: t.deviceId,
-        hasToken: Boolean(t.fcmToken),
-        nickname: t.nickname || null,
-      })),
-    });
-
-    const validTargets = targetInfos.filter((t) => t.fcmToken);
-
-    if (validTargets.length > 0) {
-      const displayName = usedByNickname ? `${usedByNickname}님` : "누군가";
-
-      const results = await Promise.allSettled(
-        validTargets.map(async (target) => {
-          console.log("[used/fcm] sending", {
-            gifticonId,
-            targetId: target.deviceId,
-            itemName: data.itemName ?? "기프티콘",
-            displayName,
-          });
-
-          const messageId = await messaging.send({
-            token: target.fcmToken,
-            notification: {
-              title: "기프티콘이 사용되었어요",
-              body: `${data.itemName ?? "기프티콘"}을 ${displayName}이 사용했어요.`,
+    const response = await client.responses.create({
+      model: "gpt-5-nano",
+      input: [
+        {
+          role: "system",
+          content: [
+            {
+              type: "input_text",
+              text:
+                "너는 한국 모바일 기프티콘 OCR 텍스트에서 정보를 추출하는 파서다. " +
+                "주어진 OCR 원문만 보고 merchantName, itemName, expiresAt, couponNumber를 추출하라. " +
+                "불확실하면 null로 반환하라. " +
+                "추측하지 말고, OCR에 없는 내용을 지어내지 마라. " +
+                "expiresAt은 날짜가 분명할 때만 ISO 8601 문자열로 반환하라. " +
+                "날짜만 보이면 해당 날짜의 한국 시간 23:59:59로 맞춰도 된다.",
             },
-            data: {
-              type: "gifticon_used",
-              gifticonId,
-              usedBy,
-              usedByNickname: usedByNickname ?? "",
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            {
+              type: "input_text",
+              text: `다음 OCR 텍스트를 파싱해라:\n\n${rawText}`,
             },
-            android: { priority: "high" },
-          });
-
-          console.log("[used/fcm] sent", {
-            gifticonId,
-            targetId: target.deviceId,
-            messageId,
-          });
-
-          return { targetId: target.deviceId, messageId };
-        })
-      );
-
-      const successCount = results.filter(
-        (result) => result.status === "fulfilled"
-      ).length;
-
-      const failCount = results.filter(
-        (result) => result.status === "rejected"
-      ).length;
-
-      console.log("[used/fcm] summary", {
-        gifticonId,
-        successCount,
-        failCount,
-        total: validTargets.length,
-      });
-
-      results.forEach((result, index) => {
-        if (result.status === "rejected") {
-          const error = result.reason as { code?: string; message?: string };
-          console.warn("[used/fcm] failed", {
-            gifticonId,
-            targetId: validTargets[index].deviceId,
-            code: error?.code ?? null,
-            message: error?.message ?? String(result.reason),
-          });
-        }
-      });
-    } else {
-      console.log(
-        `[used] no valid target FCM tokens found for gifticonId=${gifticonId}`
-      );
-    }
-
-    return NextResponse.json(
-      {
-        gifticonId,
-        usedBy,
-        usedByNickname,
-        notifiedTargetIds: validTargets.map((t) => t.deviceId),
+          ],
+        },
+      ],
+      text: {
+        format: {
+          type: "json_schema",
+          name: "gifticon_parse_result",
+          schema: gifticonSchema,
+          strict: true,
+        },
       },
-      { status: 200 }
-    );
+    });
+
+    console.log("[/api/gifticons/parse] OpenAI response received", {
+      hasOutputText: Boolean(response.output_text),
+      outputTextLength: response.output_text?.length ?? 0,
+      outputTextPreview: response.output_text?.slice(0, 200) ?? "",
+    });
+
+    const outputText = response.output_text?.trim();
+
+    if (!outputText) {
+      console.warn("[/api/gifticons/parse] model returned empty output");
+      return NextResponse.json(
+        { error: "Model returned empty output." },
+        { status: 502 }
+      );
+    }
+
+    let parsed: GifticonParseResult;
+
+    try {
+      parsed = JSON.parse(outputText) as GifticonParseResult;
+    } catch (parseError) {
+      console.error("[/api/gifticons/parse] failed to JSON.parse outputText", {
+        outputText,
+        parseError,
+      });
+
+      return NextResponse.json(
+        { error: "Model returned invalid JSON." },
+        { status: 502 }
+      );
+    }
+
+    console.log("[/api/gifticons/parse] parsed result", {
+      merchantName: parsed.merchantName,
+      itemName: parsed.itemName,
+      expiresAt: parsed.expiresAt,
+      hasCouponNumber: Boolean(parsed.couponNumber),
+      couponNumberLength: parsed.couponNumber?.length ?? 0,
+    });
+
+    return NextResponse.json(parsed, { status: 200 });
   } catch (error) {
-    console.error("[/api/gifticons/used] error:", error);
+    console.error("[/api/gifticons/parse] error:", error);
+
     return NextResponse.json(
-      { error: "Failed to mark gifticon as used." },
+      { error: "Failed to parse gifticon text." },
       { status: 500 }
     );
   }
