@@ -23,6 +23,8 @@ const generateUniqueNickname = async () => {
   for (let i = 0; i < 20; i++) {
     const candidate = generateNickname();
 
+    console.log(`[devices/register][nickname] try=${i + 1} candidate=${candidate}`);
+
     const snapshot = await db
       .collection("devices")
       .where("nickname", "==", candidate)
@@ -30,8 +32,11 @@ const generateUniqueNickname = async () => {
       .get();
 
     if (snapshot.empty) {
+      console.log(`[devices/register][nickname] selected=${candidate}`);
       return candidate;
     }
+
+    console.log(`[devices/register][nickname] duplicate=${candidate}`);
   }
 
   throw new Error("Failed to generate unique nickname.");
@@ -39,10 +44,13 @@ const generateUniqueNickname = async () => {
 
 export async function POST(req: NextRequest) {
   try {
+    console.log("[/api/devices/register] request received");
+
     let body: RegisterDeviceRequest;
     try {
       body = (await req.json()) as RegisterDeviceRequest;
-    } catch {
+    } catch (jsonError) {
+      console.warn("[/api/devices/register] invalid json body", jsonError);
       return NextResponse.json(
         { error: "Invalid JSON body." },
         { status: 400 }
@@ -51,7 +59,19 @@ export async function POST(req: NextRequest) {
 
     const { deviceId, fcmToken } = body;
 
+    console.log("[/api/devices/register] parsed body", {
+      hasDeviceId: Boolean(deviceId),
+      hasFcmToken: Boolean(fcmToken),
+      deviceId,
+      fcmTokenLength: fcmToken?.length ?? 0,
+    });
+
     if (!deviceId || !fcmToken) {
+      console.warn("[/api/devices/register] missing required fields", {
+        deviceId,
+        hasFcmToken: Boolean(fcmToken),
+      });
+
       return NextResponse.json(
         { error: "deviceId and fcmToken are required." },
         { status: 400 }
@@ -59,14 +79,25 @@ export async function POST(req: NextRequest) {
     }
 
     const docRef = db.collection("devices").doc(deviceId);
+
+    console.log(`[/api/devices/register] reading device doc: deviceId=${deviceId}`);
     const snap = await docRef.get();
 
     let nickname: string;
+    let nicknameSource: "existing" | "generated";
 
     if (snap.exists && snap.data()?.nickname) {
       nickname = snap.data()!.nickname as string;
+      nicknameSource = "existing";
+      console.log(
+        `[/api/devices/register] existing device found: deviceId=${deviceId}, nickname=${nickname}`
+      );
     } else {
       nickname = await generateUniqueNickname();
+      nicknameSource = "generated";
+      console.log(
+        `[/api/devices/register] new nickname generated: deviceId=${deviceId}, nickname=${nickname}`
+      );
     }
 
     await docRef.set(
@@ -78,7 +109,12 @@ export async function POST(req: NextRequest) {
       { merge: true }
     );
 
-    console.log(`[devices/register] deviceId=${deviceId}, nickname=${nickname}`);
+    console.log("[/api/devices/register] device saved", {
+      deviceId,
+      nickname,
+      nicknameSource,
+      fcmTokenLength: fcmToken.length,
+    });
 
     return NextResponse.json(
       {

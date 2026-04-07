@@ -17,7 +17,10 @@ type DeviceDoc = {
 
 async function getDeviceInfo(deviceId: string): Promise<DeviceDoc | null> {
   const deviceDoc = await db.collection("devices").doc(deviceId).get();
-  if (!deviceDoc.exists) return null;
+  if (!deviceDoc.exists) {
+    console.log(`[used/device] device not found deviceId=${deviceId}`);
+    return null;
+  }
 
   const data = deviceDoc.data() as DeviceDoc | undefined;
   return {
@@ -49,10 +52,13 @@ async function getNotificationTargets(
 
 export async function POST(req: NextRequest) {
   try {
+    console.log("[/api/gifticons/used] request received");
+
     let body: UsedGifticonRequest;
     try {
       body = (await req.json()) as UsedGifticonRequest;
-    } catch {
+    } catch (jsonError) {
+      console.warn("[/api/gifticons/used] invalid json body", jsonError);
       return NextResponse.json(
         { error: "Invalid JSON body." },
         { status: 400 }
@@ -61,7 +67,17 @@ export async function POST(req: NextRequest) {
 
     const { gifticonId, usedBy } = body;
 
+    console.log("[/api/gifticons/used] parsed body", {
+      gifticonId,
+      usedBy,
+    });
+
     if (!gifticonId || !usedBy) {
+      console.warn("[/api/gifticons/used] missing required fields", {
+        gifticonId,
+        usedBy,
+      });
+
       return NextResponse.json(
         { error: "gifticonId and usedBy are required." },
         { status: 400 }
@@ -69,9 +85,11 @@ export async function POST(req: NextRequest) {
     }
 
     const docRef = db.collection("gifticons").doc(gifticonId);
+    console.log(`[/api/gifticons/used] loading gifticon doc gifticonId=${gifticonId}`);
     const doc = await docRef.get();
 
     if (!doc.exists) {
+      console.warn(`[/api/gifticons/used] gifticon not found gifticonId=${gifticonId}`);
       return NextResponse.json(
         { error: "Gifticon not found." },
         { status: 404 }
@@ -80,7 +98,16 @@ export async function POST(req: NextRequest) {
 
     const data = doc.data()!;
 
+    console.log("[/api/gifticons/used] gifticon loaded", {
+      gifticonId,
+      status: data.status,
+      ownerId: data.ownerId,
+      receiverIds: Array.isArray(data.receiverIds) ? data.receiverIds : [],
+      itemName: data.itemName ?? null,
+    });
+
     if (data.status === "used") {
+      console.log(`[/api/gifticons/used] already used gifticonId=${gifticonId}`);
       return NextResponse.json(
         { gifticonId, alreadyUsed: true },
         { status: 200 }
@@ -95,16 +122,35 @@ export async function POST(req: NextRequest) {
     const isOwner = usedBy === ownerId;
     const isReceiver = receiverIds.includes(usedBy);
 
+    console.log("[/api/gifticons/used] permission check", {
+      gifticonId,
+      usedBy,
+      ownerId,
+      receiverIds,
+      isOwner,
+      isReceiver,
+    });
+
     if (!isOwner && !isReceiver) {
+      console.warn("[/api/gifticons/used] unauthorized usedBy", {
+        gifticonId,
+        usedBy,
+      });
+
       return NextResponse.json(
         { error: "usedBy is not allowed to use this gifticon." },
         { status: 403 }
       );
     }
 
-    // 닉네임은 없어도 사용 처리는 항상 진행
     const usedByDevice = await getDeviceInfo(usedBy);
     const usedByNickname = usedByDevice?.nickname?.trim() || null;
+
+    console.log("[/api/gifticons/used] actor info", {
+      usedBy,
+      usedByNickname,
+      hasActorToken: Boolean(usedByDevice?.fcmToken),
+    });
 
     await docRef.update({
       status: "used",
@@ -113,12 +159,18 @@ export async function POST(req: NextRequest) {
       usedAt: FieldValue.serverTimestamp(),
     });
 
-    console.log(
-      `[used] gifticonId=${gifticonId} marked as used by ${usedBy}, nickname=${usedByNickname}`
-    );
+    console.log("[/api/gifticons/used] marked as used", {
+      gifticonId,
+      usedBy,
+      usedByNickname,
+    });
 
-    // owner + 다른 receivers에게 모두 알림
     const targetIds = await getNotificationTargets(data, usedBy);
+
+    console.log("[/api/gifticons/used] notification targets resolved", {
+      gifticonId,
+      targetIds,
+    });
 
     const targetInfos = await Promise.all(
       targetIds.map(async (deviceId) => {
@@ -126,9 +178,19 @@ export async function POST(req: NextRequest) {
         return {
           deviceId,
           fcmToken: info?.fcmToken?.trim() ?? "",
+          nickname: info?.nickname?.trim() ?? "",
         };
       })
     );
+
+    console.log("[/api/gifticons/used] target infos", {
+      gifticonId,
+      targets: targetInfos.map((t) => ({
+        deviceId: t.deviceId,
+        hasToken: Boolean(t.fcmToken),
+        nickname: t.nickname || null,
+      })),
+    });
 
     const validTargets = targetInfos.filter((t) => t.fcmToken);
 
@@ -136,8 +198,13 @@ export async function POST(req: NextRequest) {
       const displayName = usedByNickname ? `${usedByNickname}님` : "누군가";
 
       const results = await Promise.allSettled(
-        validTargets.map((target) =>
-          messaging.send({
+        validTargets.map(async (target) => {
+          console.log("[used/fcm] sending", {
+            gifticonId,
+            targetId: target.deviceId,
+          });
+
+          const messageId = await messaging.send({
             token: target.fcmToken,
             notification: {
               title: "기프티콘이 사용되었어요",
@@ -150,8 +217,16 @@ export async function POST(req: NextRequest) {
               usedByNickname: usedByNickname ?? "",
             },
             android: { priority: "high" },
-          })
-        )
+          });
+
+          console.log("[used/fcm] sent", {
+            gifticonId,
+            targetId: target.deviceId,
+            messageId,
+          });
+
+          return { targetId: target.deviceId, messageId };
+        })
       );
 
       const successCount = results.filter(
@@ -162,16 +237,20 @@ export async function POST(req: NextRequest) {
         (result) => result.status === "rejected"
       ).length;
 
-      console.log(
-        `[used] FCM sent: success=${successCount}, fail=${failCount}, targets=${validTargets.length}`
-      );
+      console.log("[used/fcm] summary", {
+        gifticonId,
+        successCount,
+        failCount,
+        total: validTargets.length,
+      });
 
       results.forEach((result, index) => {
         if (result.status === "rejected") {
-          console.warn(
-            `[used] FCM send failed for target=${validTargets[index].deviceId}:`,
-            result.reason
-          );
+          console.warn("[used/fcm] failed", {
+            gifticonId,
+            targetId: validTargets[index].deviceId,
+            reason: result.reason,
+          });
         }
       });
     } else {
