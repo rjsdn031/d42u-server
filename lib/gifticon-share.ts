@@ -6,6 +6,7 @@ const { FieldValue } = firestore;
 export type DeviceDoc = {
   nickname?: string;
   fcmToken?: string;
+  shareEnabled?: boolean;
 };
 
 export type ShareGifticonInput = {
@@ -58,15 +59,25 @@ async function matchAndNotify({
         deviceId: d.id,
         fcmToken: data.fcmToken ?? "",
         nickname: data.nickname ?? "",
+        shareEnabled: data.shareEnabled === true,
       };
     })
-    .filter((d) => d.fcmToken !== "" && d.deviceId !== ownerId);
+    .filter(
+      (d) =>
+        d.deviceId !== ownerId &&
+        d.fcmToken !== "" &&
+        d.shareEnabled === true
+    );
 
   console.log("[share/match] candidate summary", {
     gifticonId,
     ownerId,
     candidateCount: candidates.length,
-    candidateIds: candidates.map((c) => c.deviceId),
+    candidates: candidates.map((c) => ({
+      deviceId: c.deviceId,
+      shareEnabled: c.shareEnabled,
+      hasToken: Boolean(c.fcmToken),
+    })),
   });
 
   if (candidates.length === 0) {
@@ -157,7 +168,9 @@ async function matchAndNotify({
   };
 }
 
-export async function shareGifticon(input: ShareGifticonInput): Promise<ShareGifticonResult> {
+export async function shareGifticon(
+  input: ShareGifticonInput
+): Promise<ShareGifticonResult> {
   const {
     gifticonId,
     ownerId,
@@ -182,17 +195,27 @@ export async function shareGifticon(input: ShareGifticonInput): Promise<ShareGif
   const ownerSnap = await db.collection("devices").doc(ownerId).get();
   const ownerData = ownerSnap.data() as DeviceDoc | undefined;
   const ownerNickname = ownerData?.nickname?.trim() ?? null;
+  const ownerShareEnabled = ownerData?.shareEnabled === true;
 
   console.log("[share/core] owner lookup", {
     ownerId,
     ownerExists: ownerSnap.exists,
     ownerNickname,
+    ownerShareEnabled: ownerData?.shareEnabled ?? null,
   });
 
   if (!ownerSnap.exists) {
-    console.warn(
-      `[share] owner device not registered: ownerId=${ownerId} — proceeding without nickname`
-    );
+    return {
+      gifticonId,
+      imageUrl: "",
+      ownerNickname: null,
+      matched: false,
+      receiverIds: [],
+    };
+  }
+
+  if (!ownerShareEnabled) {
+    throw new Error("OWNER_SHARE_DISABLED");
   }
 
   const existing = await db.collection("gifticons").doc(gifticonId).get();
@@ -206,7 +229,9 @@ export async function shareGifticon(input: ShareGifticonInput): Promise<ShareGif
       gifticonId,
       imageUrl: existing.data()?.imageUrl,
       ownerNickname: existing.data()?.ownerNickname ?? ownerNickname,
-      matched: Array.isArray(existing.data()?.receiverIds) && existing.data()!.receiverIds.length > 0,
+      matched:
+        Array.isArray(existing.data()?.receiverIds) &&
+        existing.data()!.receiverIds.length > 0,
       receiverIds: Array.isArray(existing.data()?.receiverIds)
         ? existing.data()!.receiverIds
         : [],

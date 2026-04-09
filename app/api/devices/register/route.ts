@@ -10,6 +10,7 @@ export const runtime = "nodejs";
 type RegisterDeviceRequest = {
   deviceId: string;
   fcmToken: string;
+  shareEnabled?: boolean;
 };
 
 const generateNickname = () => {
@@ -57,13 +58,14 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const { deviceId, fcmToken } = body;
+    const { deviceId, fcmToken, shareEnabled } = body;
 
     console.log("[/api/devices/register] parsed body", {
       hasDeviceId: Boolean(deviceId),
       hasFcmToken: Boolean(fcmToken),
       deviceId,
       fcmTokenLength: fcmToken?.length ?? 0,
+      shareEnabled,
     });
 
     if (!deviceId || !fcmToken) {
@@ -104,6 +106,7 @@ export async function POST(req: NextRequest) {
       {
         fcmToken,
         nickname,
+        shareEnabled: shareEnabled === true,
         updatedAt: FieldValue.serverTimestamp(),
       },
       { merge: true }
@@ -114,6 +117,7 @@ export async function POST(req: NextRequest) {
       nickname,
       nicknameSource,
       fcmTokenLength: fcmToken.length,
+      shareEnabled: shareEnabled === true,
     });
 
     return NextResponse.json(
@@ -121,6 +125,7 @@ export async function POST(req: NextRequest) {
         ok: true,
         deviceId,
         nickname,
+        shareEnabled: shareEnabled === true,
       },
       { status: 200 }
     );
